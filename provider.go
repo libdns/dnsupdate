@@ -16,10 +16,23 @@ import (
 type Provider struct {
 	// DNS server address
 	Addr string `json:"addr,omitempty"`
+	// Transaction signature, with format "algo:name:secret"
+	TSIG string `json:"tsig,omitempty"`
 }
 
 func (p *Provider) roundTrip(ctx context.Context, query *dns.Msg) (*dns.Msg, error) {
 	client := dns.Client{Net: "tcp"}
+
+	if p.TSIG != "" {
+		tsig := strings.Split(p.TSIG, ":")
+		if len(tsig) != 3 {
+			return nil, fmt.Errorf("invalid TSIG format: expected 3 fields, got %v", len(tsig))
+		}
+		algo, name, secret := tsig[0], tsig[1], tsig[2]
+		client.TsigSecret = map[string]string{name + ".": secret}
+		query.SetTsig(name+".", algo+".", 300, time.Now().Unix())
+	}
+
 	reply, _, err := client.ExchangeContext(ctx, query, p.Addr)
 	if err != nil {
 		return nil, err
