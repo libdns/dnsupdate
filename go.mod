@@ -3,7 +3,7 @@ module github.com/libdns/dnsupdate
 go 1.24.0
 
 require (
-	github.com/libdns/libdns v0.2.1
+	github.com/libdns/libdns v1.1.1
 	github.com/miekg/dns v1.1.70
 )
 

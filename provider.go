@@ -44,15 +44,15 @@ func (p *Provider) roundTrip(ctx context.Context, query *dns.Msg) (*dns.Msg, err
 
 // GetRecords lists all the records in the zone.
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
-	var query dns.Msg
-	query.SetAxfr(zone)
+	var axfr dns.Msg
+	axfr.SetAxfr(zone)
 
-	reply, err := p.roundTrip(ctx, &query)
+	reply, err := p.roundTrip(ctx, &axfr)
 	if err != nil {
 		return nil, err
 	}
 
-	return unmarshalRecords(zone, reply.Answer), nil
+	return unmarshalRecords(zone, reply.Answer)
 }
 
 // AppendRecords adds records to the zone. It returns the records that were added.
@@ -62,20 +62,28 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		return nil, err
 	}
 
-	var query dns.Msg
-	query.SetUpdate(zone)
-	query.Insert(rrs)
+	var update dns.Msg
+	update.SetUpdate(zone)
+	update.Insert(rrs)
 
-	if _, err := p.roundTrip(ctx, &query); err != nil {
+	if _, err := p.roundTrip(ctx, &update); err != nil {
 		return nil, err
 	}
 
-	return unmarshalRecords(zone, rrs), nil
+	return unmarshalRecords(zone, rrs)
 }
 
 // SetRecords sets the records in the zone, either by updating existing records or creating new ones.
 // It returns the updated records.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	var axfr dns.Msg
+	axfr.SetAxfr(zone)
+
+	reply, err := p.roundTrip(ctx, &axfr)
+	if err != nil {
+		return nil, err
+	}
+
 	insertRRs, err := marshalRecords(zone, records)
 	if err != nil {
 		return nil, err
@@ -89,49 +97,30 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 
 	// Remove old RRs that aren't in the set of new RRs
 	var removeRRs []dns.RR
-	for _, record := range records {
-		if record.ID == "" {
+	for _, rr := range reply.Answer {
+		if _, ok := m[rr.String()]; ok {
 			continue
 		}
-		if _, ok := m[record.ID]; ok {
-			continue
-		}
-
-		rr, err := parseRecordID(record.ID)
-		if err != nil {
-			return nil, err
-		}
-
 		removeRRs = append(removeRRs, rr)
 	}
 
-	var query dns.Msg
-	query.SetUpdate(zone)
-	query.Insert(insertRRs)
-	query.Remove(removeRRs)
+	var update dns.Msg
+	update.SetUpdate(zone)
+	update.Insert(insertRRs)
+	update.Remove(removeRRs)
 
-	if _, err := p.roundTrip(ctx, &query); err != nil {
+	if _, err := p.roundTrip(ctx, &update); err != nil {
 		return nil, err
 	}
 
-	return unmarshalRecords(zone, insertRRs), nil
+	return unmarshalRecords(zone, insertRRs)
 }
 
 // DeleteRecords deletes the records from the zone. It returns the records that were deleted.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	rrs := make([]dns.RR, len(records))
 	for i, record := range records {
-		// If a record ID was supplied, use that. Otherwise, generate a RR
-		// from the record data fields.
-		var (
-			rr  dns.RR
-			err error
-		)
-		if record.ID != "" {
-			rr, err = parseRecordID(record.ID)
-		} else {
-			rr, err = marshalRecord(zone, &record)
-		}
+		rr, err := marshalRecord(zone, record)
 		if err != nil {
 			return nil, err
 		}
@@ -143,15 +132,15 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		return nil, err
 	}
 
-	var query dns.Msg
-	query.SetUpdate(zone)
-	query.Remove(rrs)
+	var update dns.Msg
+	update.SetUpdate(zone)
+	update.Remove(rrs)
 
-	if _, err := p.roundTrip(ctx, &query); err != nil {
+	if _, err := p.roundTrip(ctx, &update); err != nil {
 		return nil, err
 	}
 
-	return unmarshalRecords(zone, rrs), err
+	return unmarshalRecords(zone, rrs)
 }
 
 // Interface guards
@@ -165,48 +154,38 @@ var (
 func marshalRecords(zone string, records []libdns.Record) ([]dns.RR, error) {
 	rrs := make([]dns.RR, 0, len(records))
 	for _, record := range records {
-		rr, err := marshalRecord(zone, &record)
+		rr, err := marshalRecord(zone, record)
 		if err != nil {
-			return nil, err
+			return rrs, err
 		}
 		rrs = append(rrs, rr)
 	}
 	return rrs, nil
 }
 
-func marshalRecord(zone string, record *libdns.Record) (dns.RR, error) {
-	fqdn := libdns.AbsoluteName(record.Name, zone)
-	ttl := uint32(record.TTL / time.Second)
-	raw := fmt.Sprintf("%v %v IN %v %v", fqdn, ttl, record.Type, record.Value)
+func marshalRecord(zone string, record libdns.Record) (dns.RR, error) {
+	libdnsrr := record.RR()
+	fqdn := libdns.AbsoluteName(libdnsrr.Name, zone)
+	ttl := uint32(libdnsrr.TTL / time.Second)
+	raw := fmt.Sprintf("%v %v IN %v %v", fqdn, ttl, libdnsrr.Type, libdnsrr.Data)
 	return dns.NewRR(raw)
 }
 
-func unmarshalRecords(zone string, rrs []dns.RR) []libdns.Record {
+func unmarshalRecords(zone string, rrs []dns.RR) ([]libdns.Record, error) {
 	records := make([]libdns.Record, 0, len(rrs))
 	for _, rr := range rrs {
 		hdr := rr.Header()
-		records = append(records, libdns.Record{
-			ID:    formatRecordID(rr, zone),
-			Type:  dns.Type(hdr.Rrtype).String(),
-			Name:  hdr.Name,
-			Value: strings.TrimPrefix(rr.String(), hdr.String()),
-			TTL:   time.Duration(hdr.Ttl) * time.Second,
-		})
+		libdnsrr := libdns.RR{
+			Name: libdns.RelativeName(hdr.Name, zone),
+			TTL:  time.Duration(hdr.Ttl) * time.Second,
+			Type: dns.Type(hdr.Rrtype).String(),
+			Data: strings.TrimPrefix(rr.String(), hdr.String()),
+		}
+		record, err := libdnsrr.Parse()
+		if err != nil {
+			return records, err
+		}
+		records = append(records, record)
 	}
-	return records
-}
-
-func formatRecordID(rr dns.RR, zone string) string {
-	// We use the zone file representation of the record (with FQDN) as ID
-	rr = dns.Copy(rr)
-	rr.Header().Name = libdns.AbsoluteName(rr.Header().Name, zone)
-	return rr.String()
-}
-
-func parseRecordID(id string) (dns.RR, error) {
-	rr, err := dns.NewRR(id)
-	if err != nil {
-		return nil, fmt.Errorf("invalid record ID (%v)", err)
-	}
-	return rr, nil
+	return records, nil
 }
