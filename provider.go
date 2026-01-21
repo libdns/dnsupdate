@@ -4,12 +4,13 @@ package dnsupdate
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/libdns/libdns"
-	"github.com/miekg/dns"
 )
 
 // Provider facilitates DNS record manipulation with the DNS UPDATE protocol.
@@ -21,19 +22,26 @@ type Provider struct {
 }
 
 func (p *Provider) roundTrip(ctx context.Context, query *dns.Msg) (*dns.Msg, error) {
-	client := dns.Client{Net: "tcp"}
+	var client dns.Client
 
 	if p.TSIG != "" {
-		tsig := strings.Split(p.TSIG, ":")
-		if len(tsig) != 3 {
-			return nil, fmt.Errorf("invalid TSIG format: expected 3 fields, got %v", len(tsig))
+		params := strings.Split(p.TSIG, ":")
+		if len(params) != 3 {
+			return nil, fmt.Errorf("invalid TSIG format: expected 3 fields, got %v", len(params))
 		}
-		algo, name, secret := tsig[0], tsig[1], tsig[2]
-		client.TsigSecret = map[string]string{name + ".": secret}
-		query.SetTsig(name+".", algo+".", 300, time.Now().Unix())
+		algo, name, secret := params[0], params[1], params[2]
+		rawSecret, err := base64.StdEncoding.DecodeString(secret)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TSIG secret: %v", err)
+		}
+
+		client.Transfer.TSIGSigner = dns.HmacTSIG{Secret: rawSecret}
+
+		tsig := dns.NewTSIG(name+".", algo+".", 0)
+		query.Extra = append(query.Extra, tsig)
 	}
 
-	reply, _, err := client.ExchangeContext(ctx, query, p.Addr)
+	reply, _, err := client.Exchange(ctx, query, "tcp", p.Addr)
 	if err != nil {
 		return nil, err
 	} else if reply.Rcode != dns.RcodeSuccess {
@@ -44,10 +52,9 @@ func (p *Provider) roundTrip(ctx context.Context, query *dns.Msg) (*dns.Msg, err
 
 // GetRecords lists all the records in the zone.
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
-	var axfr dns.Msg
-	axfr.SetAxfr(zone)
+	axfr := dns.NewMsg(zone, dns.TypeAXFR)
 
-	reply, err := p.roundTrip(ctx, &axfr)
+	reply, err := p.roundTrip(ctx, axfr)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +69,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		return nil, err
 	}
 
-	var update dns.Msg
-	update.SetUpdate(zone)
+	update := dns.NewMsg(zone, dns.TypeSOA)
 	update.Insert(rrs)
 
 	if _, err := p.roundTrip(ctx, &update); err != nil {
@@ -76,10 +82,9 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 // SetRecords sets the records in the zone, either by updating existing records or creating new ones.
 // It returns the updated records.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	var axfr dns.Msg
-	axfr.SetAxfr(zone)
+	axfr := dns.NewMsg(zone, dns.TypeAXFR)
 
-	reply, err := p.roundTrip(ctx, &axfr)
+	reply, err := p.roundTrip(ctx, axfr)
 	if err != nil {
 		return nil, err
 	}
